@@ -28,11 +28,6 @@ type TranscriptionBackend = (file: TFile) => Promise<string>;
 
 const MAX_TRIES = 100
 
-function splitByColon(text)
-{
-    return text.toString().replace(/^(.*?):*$/, '$1');
-}
-
 export class TranscriptionEngine {
     settings: TranscriptionSettings;
     vault: Vault;
@@ -143,7 +138,7 @@ export class TranscriptionEngine {
     async getTranscriptionWhisperASR(file: TFile): Promise<string> {
 
         // Generate API KEY, see: https://docs.speechflow.io/#/?id=generate-api-key
-        const apiKeyData = splitByColon(this.settings.whisperASRApiKey);
+        const apiKeyData = this.settings.whisperASRUrls.split(":");
         const API_KEY_ID = apiKeyData[0];
         const API_KEY_SECRET = apiKeyData[1];
 
