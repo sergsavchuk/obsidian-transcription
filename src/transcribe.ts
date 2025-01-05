@@ -8,9 +8,30 @@ import { SupabaseClient } from "@supabase/supabase-js";
 import * as tus from "tus-js-client";
 import { WhisperASRResponse, WhisperASRSegment } from "./types/whisper-asr";
 
+import { ClientRequest, IncomingMessage } from 'http';
+
+const https = require('https');
+const { randomUUID } = require("crypto");
+
+// The language code of the speech in media file.
+// See more lang code: https://docs.speechflow.io/#/?id=ap-lang-list
+const LANG = "ru";
+
+// The translation result type.
+// 1, the default result type, the json format for sentences and words with begin time and end time.
+// 2, the json format for the generated subtitles with begin time and end time.
+// 3, the srt format for the generated subtitles with begin time and end time.
+// 4, the plain text format for transcription results without begin time and end time.
+const RESULT_TYPE = 1;
+
 type TranscriptionBackend = (file: TFile) => Promise<string>;
 
 const MAX_TRIES = 100
+
+function splitByColon(text)
+{
+    return text.toString().replace(/^(.*?):*$/, '$1');
+}
 
 export class TranscriptionEngine {
     settings: TranscriptionSettings;
@@ -120,92 +141,132 @@ export class TranscriptionEngine {
     }
 
     async getTranscriptionWhisperASR(file: TFile): Promise<string> {
-        const payload_data: PayloadData = {};
-        payload_data["audio_file"] = new Blob([
-            await this.vault.readBinary(file),
+
+        // Generate API KEY, see: https://docs.speechflow.io/#/?id=generate-api-key
+        const apiKeyData = splitByColon(this.settings.whisperASRApiKey);
+        const API_KEY_ID = apiKeyData[0];
+        const API_KEY_SECRET = apiKeyData[1];
+
+        //Parameter of the remote file
+        const createData = `lang=${LANG}&remotePath=${file.name}`;
+
+         let createRequest:ClientRequest;
+
+        console.log('submitting a local file');
+        let formData = '';
+        const boundary:string = randomUUID().replace(/-/g, "");
+        formData += "--" + boundary + "\r\n";
+        formData += 'Content-Disposition: form-data; name="file"; filename="' + file.name + '"\r\n';
+        formData += "Content-Type: application/octet-stream\r\n\r\n";
+        let formDataBuffer:Buffer = Buffer.concat([
+            Buffer.from(formData, "utf8"),
+            new Uint8Array(await this.vault.readBinary(file)),
+            Buffer.from("\r\n--" + boundary + "--\r\n", "utf8"),
         ]);
-        const [request_body, boundary_string] =
-            await payloadGenerator(payload_data);
 
-        let args = "output=json"; // always output json, so we can have the timestamps if we need them
-        args += `&word_timestamps=true`; // always output word timestamps, so we can have the timestamps if we need them
-        const { translate, encode, vadFilter, language, initialPrompt } = this.settings;
-        if (translate) args += `&task=translate`;
-        if (encode !== DEFAULT_SETTINGS.encode) args += `&encode=${encode}`;
-        if (vadFilter !== DEFAULT_SETTINGS.vadFilter) args += `&vad_filter=${vadFilter}`;
-        if (language !== DEFAULT_SETTINGS.language) args += `&language=${language}`;
-        if (initialPrompt) args += `&initial_prompt=${initialPrompt}`;
+        createRequest = https.request({
+            method: 'POST',
+            headers: {
+                "Content-Type": `multipart/form-data; boundary=${boundary}`,
+                "Content-Length": formDataBuffer.length,
+                'keyId': API_KEY_ID,
+                'keySecret': API_KEY_SECRET,
+            },
+            hostname: 'api.speechflow.io',
+            path: '/asr/file/v1/create?lang=' + LANG
+        });
+        createRequest.write(formDataBuffer)
 
-        const urls = this.settings.whisperASRUrls
-            .split(";")
-            .filter(Boolean); // Remove empty strings
 
-        for (const baseUrl of urls) {
-            const url = `${baseUrl}/asr?${args}`;
-            console.log("Trying URL:", url);
 
-            const options: RequestUrlParam = {
-                method: "POST",
-                url: url,
-                contentType: `multipart/form-data; boundary=----${boundary_string}`,
-                body: request_body,
-            };
 
-            console.log("Options:", options);
+    const promise = new Promise<string>( (resolve, reject) => {
 
-            try {
-                const response = await requestUrl(options);
-                if (this.settings.debug) console.log("Raw response:", response);
 
-                // ASR_ENGINE=faster_whisper returns segments as an array. Preprocess it to match the standard.
-                const preprocessed = Array.isArray(response.json.segments[0])
-                    ? preprocessWhisperASRResponse(response.json) : response.json as WhisperASRResponse;
 
-                if (this.settings.debug) console.log("Preprocessed response:", preprocessed);
+        createRequest.on('response', (createResponse:IncomingMessage):void => {
+            let responseData = '';
 
-                // Create segments for each word timestamp if word timestamps are available
-                const wordSegments = preprocessed.segments
-                    .reduce((acc: components["schemas"]["TimestampedTextSegment"][], segment: WhisperASRSegment) => {
-                        if (segment.words) {
-                            acc.push(...segment.words.map(wordTimestamp => ({
-                                start: wordTimestamp.start,
-                                end: wordTimestamp.end,
-                                text: wordTimestamp.word
-                            } as components["schemas"]["TimestampedTextSegment"])));
-                        }
-                        return acc;
-                    }, []);
+            createResponse.on('data', (chunk:string):void => {
+                responseData += chunk;
+            });
 
-                if (this.settings.wordTimestamps) {
-                    return this.segmentsToTimestampedString(wordSegments, this.settings.timestampFormat);
-                } else if (parseInt(this.settings.timestampInterval)) {
-                    // Feed the function word segments with the interval
-                    return this.segmentsToTimestampedString(wordSegments, this.settings.timestampFormat, parseInt(this.settings.timestampInterval));
-                } else if (this.settings.timestamps) {
-                    // Use existing segment-to-string functionality if only segment timestamps are needed
-                    const segments = preprocessed.segments.map((segment: WhisperASRSegment) => ({
-                        start: segment.start,
-                        end: segment.end,
-                        text: segment.text
-                    }));
-                    return this.segmentsToTimestampedString(segments, this.settings.timestampFormat);
-                } else if (preprocessed.segments) {
-                    // Concatenate all segments into a single string if no timestamps are required
-                    return preprocessed.segments
-                        .map((segment: WhisperASRSegment) => segment.text)
-                        .map(s => s.trim())
-                        .join("\n");
+            createResponse.on('end', ():void => {
+                const responseJSON:{code: number, taskId: string, msg: string} = JSON.parse(responseData);
+                let taskId
+                if (responseJSON.code == 10000) {
+                    taskId = responseJSON.taskId;
                 } else {
-                    // Fallback to full text if no segments are there
-                    return preprocessed.text;
+                    console.log("create error:");
+                    console.log(responseJSON.msg);
+
+                    reject(responseJSON.msg);
+
+                    return ;
                 }
-            } catch (error) {
-                if (this.settings.debug) console.error("Error with URL:", url, error);
-                // Don't return or throw yet, try the next URL
-            }
-        }
-        // If all URLs fail, reject the promise with a generic error or the last specific error caught
-        return Promise.reject("All Whisper ASR URLs failed");
+
+                let intervalID: ReturnType<typeof setInterval> = setInterval(() => {
+                    const queryRequest:ClientRequest = https.request({
+                        method: 'GET',
+                        headers: {
+                            'keyId': API_KEY_ID,
+                            'keySecret': API_KEY_SECRET
+                        },
+                        hostname: 'api.speechflow.io',
+                        path: '/asr/file/v1/query?taskId=' + taskId + '&resultType=' + RESULT_TYPE
+                    }, (queryResponse:IncomingMessage):void => {
+                        let responseData = '';
+
+                        queryResponse.on('data', (chunk:string):void => {
+                            responseData += chunk;
+                        });
+
+                        queryResponse.on('end', ():void => {
+                            const responseJSON:{ code: number, msg: string} = JSON.parse(responseData);
+                            if (responseJSON.code === 11000) {
+                                const sentencesJSON = JSON.parse(responseJSON.result);
+                                const sentences = sentencesJSON.sentences.map((s) => s.s);
+                                const result = sentences.join(' ');
+                                console.log('transcription result:');
+                                console.log(result);
+                                resolve(result);
+
+
+                                clearInterval(intervalID);
+                            } else if (responseJSON.code == 11001) {
+                                console.log('waiting');
+                            } else {
+                                console.log("transcription error:");
+                                console.log(responseJSON.msg);
+
+                                reject(responseJSON.msg);
+
+                                clearInterval(intervalID);
+                            }
+                        });
+                    });
+
+                    queryRequest.on('error', (error:Error):void => {
+                        console.error(error);
+
+                        reject(error);
+
+                        clearInterval(intervalID);
+                    });
+                    queryRequest.end();
+                }, 3000);
+            });
+        });
+
+        createRequest.on('error', (error:Error):void => {
+            console.error(error);
+        });
+
+        createRequest.write(createData);
+        createRequest.end();
+        });
+
+    return promise;
     }
 
     async getTranscriptionSwiftink(file: TFile): Promise<string> {
